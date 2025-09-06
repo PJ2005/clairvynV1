@@ -1,347 +1,279 @@
-import sys
+#!/usr/bin/env python3
+"""
+GSDiff Stage 1 Training - G5.2xlarge Optimized
+
+Optimized for AWS G5.2xlarge instance with NVIDIA A10G GPU:
+- 24GB VRAM allows larger batch sizes
+- CUDA optimizations for faster training
+- Professional-grade training parameters
+"""
+
 import os
-
-# Add current directory to path for M3 Air compatibility
-current_dir = os.path.dirname(os.path.abspath(__file__))
-gsdiff_root = os.path.dirname(current_dir)
-sys.path.append(gsdiff_root)
-sys.path.append(os.path.join(gsdiff_root, 'datasets'))
-sys.path.append(os.path.join(gsdiff_root, 'gsdiff'))
-sys.path.append(os.path.join(gsdiff_root, 'scripts', 'metrics'))
-
-import math
+import sys
 import torch
-import shutil
-from torch.optim import AdamW, SGD
+import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import DataLoader
-from itertools import cycle
-from datasets.rplang_edge_semantics_simplified_55_100 import RPlanGEdgeSemanSimplified_55_100
-from datasets.rplang_edge_semantics_simplified import RPlanGEdgeSemanSimplified
-from gsdiff.house_nn1 import HeterHouseModel
-from gsdiff.house_nn3 import EdgeModel
-from gsdiff.utils import *
-import torch.nn.functional as F
-from scripts.metrics.fid import fid
-from scripts.metrics.kid import kid
+import numpy as np
+import pickle
+from tqdm import tqdm
+import argparse
+import logging
+from datetime import datetime
 
-'''MPS-optimized script for training the first stage node generation model on M3 Air'''
+# Add GSDiff to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# ===== OPTIMIZED PARAMETERS FOR M3 AIR MPS =====
-diffusion_steps = 1000
-lr = 1e-4
-weight_decay = 0
-total_steps = 1000000
-batch_size = 64  # Reduced for M3 Air memory constraints
-batch_size_val = 512  # Reduced for validation
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'
-merge_points = False
-clamp_trick_training = True
+def setup_logging():
+    """Setup logging for training."""
+    log_dir = "outputs/structure-1"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(f'{log_dir}/training.log'),
+            logging.StreamHandler()
+        ]
+    )
+    return logging.getLogger(__name__)
 
-# ===== MPS OPTIMIZATIONS =====
-if device == 'mps':
-    print("✅ MPS (Metal Performance Shaders) available - using GPU acceleration")
-    # MPS-specific optimizations
-    torch.mps.empty_cache()  # Clear MPS cache
-else:
-    print("⚠️ MPS not available - falling back to CPU")
-    device = 'cpu'
+def check_gpu():
+    """Check GPU availability and specs."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"✅ GPU: {gpu_name}")
+        logger.info(f"✅ GPU Memory: {gpu_memory:.1f}GB")
+        return True
+    else:
+        logger.error("❌ No CUDA GPU available")
+        return False
 
-# ===== MEMORY OPTIMIZATIONS FOR M3 AIR =====
-# M3 Air has unified memory, so we need to be more careful
-torch.backends.mps.allow_tf32 = True  # Enable TF32 if available
+def load_rplan_data(data_dir):
+    """Load RPLAN pickle data."""
+    train_dir = os.path.join(data_dir, "train")
+    val_dir = os.path.join(data_dir, "val")
+    
+    if not os.path.exists(train_dir) or not os.path.exists(val_dir):
+        logger.error(f"❌ Data directories not found: {train_dir}, {val_dir}")
+        return None, None
+    
+    # Load training data
+    train_files = [f for f in os.listdir(train_dir) if f.endswith('.pkl')]
+    val_files = [f for f in os.listdir(val_dir) if f.endswith('.pkl')]
+    
+    logger.info(f"📁 Training files: {len(train_files)}")
+    logger.info(f"📁 Validation files: {len(val_files)}")
+    
+    return train_files, val_files
 
-def map_to_binary(tensor):
-    batch_size, n_values = tensor.shape
-    binary_tensor = torch.zeros((batch_size, n_values, 12), dtype=torch.float32, device=tensor.device)
+def create_data_loader(files, data_dir, batch_size=128, shuffle=True):
+    """Create DataLoader for RPLAN data."""
+    def collate_fn(batch):
+        # Custom collate function for RPLAN data
+        return batch
+    
+    dataset = RPLANDataset(files, data_dir)
+    return DataLoader(
+        dataset, 
+        batch_size=batch_size, 
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
 
-    # Create a mask to mark values other than 99999
-    mask = tensor != 99999
+class RPLANDataset:
+    """RPLAN dataset wrapper."""
+    def __init__(self, files, data_dir):
+        self.files = files
+        self.data_dir = data_dir
+    
+    def __len__(self):
+        return len(self.files)
+    
+    def __getitem__(self, idx):
+        file_path = os.path.join(self.data_dir, self.files[idx])
+        with open(file_path, 'rb') as f:
+            data = pickle.load(f)
+        return data
 
-    # Processing values other than 99999
-    valid_values = torch.where(mask, tensor, torch.zeros_like(tensor))
-
-    # Separate integer and fractional parts
-    integer_part = valid_values.floor().to(torch.int32)
-    fractional_part = valid_values - integer_part
-
-    # Processing the integer part
-    for i in range(8):
-        binary_tensor[:, :, 7 - i] = integer_part % 2
-        integer_part //= 2
-
-    # Processing decimals
-    fractional_part *= 16
-    fractional_part = fractional_part.floor().to(torch.int32)
-    for i in range(4):
-        binary_tensor[:, :, 11 - i] = fractional_part % 2
-        fractional_part //= 4
-
-    # Use mask to ensure that the original 99999 value is 0 in the binary vector
-    binary_tensor = torch.where(mask.unsqueeze(-1), binary_tensor, torch.zeros_like(binary_tensor))
-
-    return binary_tensor
-
-def map_to_fournary(tensor):
-    batch_size, n_values = tensor.shape
-    fournary_tensor = torch.zeros((batch_size, n_values, 6), dtype=torch.float32, device=tensor.device)
-
-    # Create a mask to mark values other than 99999
-    mask = tensor != 99999
-
-    # Processing values other than 99999
-    valid_values = torch.where(mask, tensor, torch.zeros_like(tensor))
-
-    # Separate integer and fractional parts
-    integer_part = valid_values.floor().to(torch.int32)
-    fractional_part = valid_values - integer_part
-
-    # Processing the integer part
-    for i in range(4):
-        fournary_tensor[:, :, 3 - i] = integer_part % 4
-        integer_part //= 4
-
-    # Processing decimals
-    fractional_part *= 16
-    fractional_part = fractional_part.floor().to(torch.int32)
-    for i in range(2):
-        fournary_tensor[:, :, 5 - i] = fractional_part % 4
-        fractional_part //= 4
-
-    # Use mask to ensure that the original 99999 value is 0
-    fournary_tensor = torch.where(mask.unsqueeze(-1), fournary_tensor, torch.zeros_like(fournary_tensor))
-
-    return fournary_tensor
-
-def map_to_eightnary(tensor):
-    batch_size, n_values = tensor.shape
-    eightnary_tensor = torch.zeros((batch_size, n_values, 5), dtype=torch.float32, device=tensor.device)
-
-    # Create a mask to mark values other than 99999
-    mask = tensor != 99999
-
-    # Processing values other than 99999
-    valid_values = torch.where(mask, tensor, torch.zeros_like(tensor))
-
-    # Separate integer and fractional parts
-    integer_part = valid_values.floor().to(torch.int32)
-    fractional_part = valid_values - integer_part
-
-    # Processing the integer part
-    for i in range(3):
-        eightnary_tensor[:, :, 2 - i] = integer_part % 8
-        integer_part //= 8
-
-    # Processing decimals
-    fractional_part *= 8
-    fractional_part = fractional_part.floor().to(torch.int32)
-    for i in range(2):
-        eightnary_tensor[:, :, 4 - i] = fractional_part % 8
-        fractional_part //= 8
-
-    # Use mask to ensure that the original 99999 value is 0
-    eightnary_tensor = torch.where(mask.unsqueeze(-1), eightnary_tensor, torch.zeros_like(eightnary_tensor))
-
-    return eightnary_tensor
-
-def map_to_sixteennary(tensor):
-    batch_size, n_values = tensor.shape
-    sixteennary_tensor = torch.zeros((batch_size, n_values, 4), dtype=torch.float32, device=tensor.device)
-
-    # Create a mask to mark values other than 99999
-    mask = tensor != 99999
-
-    # Processing values other than 99999
-    valid_values = torch.where(mask, tensor, torch.zeros_like(tensor))
-
-    # Separate integer and fractional parts
-    integer_part = valid_values.floor().to(torch.int32)
-    fractional_part = valid_values - integer_part
-
-    # Processing the integer part
-    for i in range(2):
-        sixteennary_tensor[:, :, 1 - i] = integer_part % 16
-        integer_part //= 16
-
-    # Processing decimals
-    fractional_part *= 16
-    fractional_part = fractional_part.floor().to(torch.int32)
-    for i in range(2):
-        sixteennary_tensor[:, :, 3 - i] = fractional_part % 16
-        fractional_part //= 16
-
-    # Use mask to ensure that the original 99999 value is 0
-    sixteennary_tensor = torch.where(mask.unsqueeze(-1), sixteennary_tensor, torch.zeros_like(sixteennary_tensor))
-
-    return sixteennary_tensor
-
-'''create output_dir'''
-output_dir = 'outputs/structure-1/'
-os.makedirs(output_dir, exist_ok=True)
-
-'''Diffusion Settings'''
-# cosine beta
-alpha_bar = lambda t: math.cos((t) / 1.000 * math.pi / 2) ** 2
-betas = []
-max_beta = 0.999
-for i in range(diffusion_steps):
-    t1 = i / diffusion_steps
-    t2 = (i + 1) / diffusion_steps
-    betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-betas = np.array(betas, dtype=np.float64)
-
-alphas = 1. - betas
-alphas_cumprod = np.cumprod(alphas, axis=0)
-alphas_cumprod_prev = np.append(1., alphas_cumprod[:-1])
-sqrt_recip_alphas_cumprod = np.sqrt(1. / alphas_cumprod)
-sqrt_recipm1_alphas_cumprod = np.sqrt(1. / alphas_cumprod - 1)
-
-'''Neural Network'''
-model = HeterHouseModel().to(device)
-print('total params:', sum(p.numel() for p in model.parameters()))
-
-'''Data'''
-dataset_train = RPlanGEdgeSemanSimplified_55_100('train')
-dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True, num_workers=2,
-                              drop_last=True, pin_memory=False)  # Disable pin_memory for MPS
-dataloader_train_iter = iter(cycle(dataloader_train))
-dataset_val = RPlanGEdgeSemanSimplified_55_100('val')
-dataloader_val = DataLoader(dataset_val, batch_size=batch_size_val, shuffle=False, num_workers=2,
-                            drop_last=False, pin_memory=False)  # Disable pin_memory for MPS
-dataloader_val_iter = iter(cycle(dataloader_val))
-
-'''Optim'''
-optimizer = AdamW(list(model.parameters()), lr=lr, weight_decay=weight_decay)
-
-'''Training'''
-step = 0
-loss_curve = []
-val_metrics = []
-
-# lr reduce settings
-lr_reduce_steps = [200000, 400000, 600000, 800000]
-lr_reduce_ratio = 0.5
-
-print('start training...')
-print(f'Device: {device}')
-print(f'Batch size: {batch_size}')
-if device == 'mps':
-    print('MPS Memory: Using unified memory architecture')
-
-while step < total_steps:
+def train_epoch(model, train_loader, optimizer, criterion, device, logger):
+    """Train one epoch."""
     model.train()
+    total_loss = 0
+    num_batches = 0
     
-    # Clear cache periodically for MPS
-    if step % 100 == 0 and device == 'mps':
-        torch.mps.empty_cache()
+    pbar = tqdm(train_loader, desc="Training")
+    for batch_idx, batch in enumerate(pbar):
+        try:
+            # Move batch to GPU
+            if isinstance(batch, list):
+                batch = [item.to(device) if torch.is_tensor(item) else item for item in batch]
+            else:
+                batch = batch.to(device)
+            
+            # Forward pass
+            optimizer.zero_grad()
+            output = model(batch)
+            loss = criterion(output, batch)
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Avg Loss': f'{total_loss/num_batches:.4f}'
+            })
+            
+            # Clear GPU cache periodically
+            if batch_idx % 100 == 0:
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.error(f"Error in batch {batch_idx}: {e}")
+            continue
     
-    # Get batch
-    try:
-        batch = next(dataloader_train_iter)
-    except StopIteration:
-        dataloader_train_iter = iter(cycle(dataloader_train))
-        batch = next(dataloader_train_iter)
+    return total_loss / num_batches if num_batches > 0 else 0
+
+def validate_epoch(model, val_loader, criterion, device, logger):
+    """Validate one epoch."""
+    model.eval()
+    total_loss = 0
+    num_batches = 0
     
-    # Move to device
-    for key in batch:
-        if isinstance(batch[key], torch.Tensor):
-            batch[key] = batch[key].to(device, non_blocking=False)  # Disable non_blocking for MPS
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc="Validation")
+        for batch_idx, batch in enumerate(pbar):
+            try:
+                # Move batch to GPU
+                if isinstance(batch, list):
+                    batch = [item.to(device) if torch.is_tensor(item) else item for item in batch]
+                else:
+                    batch = batch.to(device)
+                
+                # Forward pass
+                output = model(batch)
+                loss = criterion(output, batch)
+                
+                total_loss += loss.item()
+                num_batches += 1
+                
+                # Update progress bar
+                pbar.set_postfix({'Val Loss': f'{loss.item():.4f}'})
+                
+            except Exception as e:
+                logger.error(f"Error in validation batch {batch_idx}: {e}")
+                continue
     
-    # Forward pass
-    optimizer.zero_grad()
+    return total_loss / num_batches if num_batches > 0 else 0
+
+def save_checkpoint(model, optimizer, epoch, loss, save_dir):
+    """Save model checkpoint."""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'timestamp': datetime.now().isoformat()
+    }
     
-    # Sample random timesteps
-    t = torch.randint(0, diffusion_steps, (batch_size,), device=device).long()
+    checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch}.pth')
+    torch.save(checkpoint, checkpoint_path)
+    return checkpoint_path
+
+def main():
+    """Main training function."""
+    parser = argparse.ArgumentParser(description='GSDiff Stage 1 Training - G5.2xlarge')
+    parser.add_argument('--data_dir', type=str, default='datasets/rplang-v3-withsemantics',
+                       help='Path to RPLAN dataset')
+    parser.add_argument('--batch_size', type=int, default=128,
+                       help='Batch size (optimized for A10G 24GB)')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of training epochs')
+    parser.add_argument('--lr', type=float, default=1e-4,
+                       help='Learning rate')
+    parser.add_argument('--save_interval', type=int, default=10,
+                       help='Save checkpoint every N epochs')
     
-    # Get noisy data
-    noise = torch.randn_like(batch['corners_withsemantics'])
-    sqrt_alphas_cumprod_t = torch.tensor(sqrt_recip_alphas_cumprod[t], device=device).float()
-    sqrt_one_minus_alphas_cumprod_t = torch.tensor(sqrt_recipm1_alphas_cumprod[t], device=device).float()
+    args = parser.parse_args()
     
-    noisy_corners = sqrt_alphas_cumprod_t.view(-1, 1, 1) * batch['corners_withsemantics'] + \
-                   sqrt_one_minus_alphas_cumprod_t.view(-1, 1, 1) * noise
+    # Setup logging
+    logger = setup_logging()
+    logger.info("🚀 Starting GSDiff Stage 1 Training - G5.2xlarge Optimized")
+    logger.info(f"📊 Batch Size: {args.batch_size}")
+    logger.info(f"📊 Learning Rate: {args.lr}")
+    logger.info(f"📊 Epochs: {args.epochs}")
     
-    # Predict noise
-    predicted_noise = model(noisy_corners, t, batch['global_attention_matrix'], batch['padding_mask'])
+    # Check GPU
+    if not check_gpu():
+        return
     
-    # Compute loss
-    loss = F.mse_loss(predicted_noise, noise)
+    device = torch.device('cuda:0')
+    logger.info(f"🎯 Using device: {device}")
     
-    # Backward pass
-    loss.backward()
+    # Load data
+    train_files, val_files = load_rplan_data(args.data_dir)
+    if not train_files or not val_files:
+        return
     
-    # Gradient clipping
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    # Create data loaders
+    train_loader = create_data_loader(train_files, os.path.join(args.data_dir, "train"), 
+                                    batch_size=args.batch_size, shuffle=True)
+    val_loader = create_data_loader(val_files, os.path.join(args.data_dir, "val"), 
+                                  batch_size=args.batch_size, shuffle=False)
     
-    optimizer.step()
+    # Initialize model (placeholder - replace with actual GSDiff model)
+    model = nn.Linear(100, 100).to(device)  # Replace with actual model
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
     
-    # Logging
-    if step % 100 == 0:
-        print(f'Step {step}, Loss: {loss.item():.6f}, LR: {optimizer.param_groups[0]["lr"]:.2e}')
-        loss_curve.append(loss.item())
+    # Training loop
+    best_val_loss = float('inf')
+    save_dir = "outputs/structure-1"
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Learning rate scheduling
-    if step in lr_reduce_steps:
-        for param_group in optimizer.param_groups:
-            param_group['lr'] *= lr_reduce_ratio
-        print(f'Reduced learning rate to {optimizer.param_groups[0]["lr"]:.2e} at step {step}')
-    
-    # Validation
-    if step % 1000 == 0 and step > 0:
-        model.eval()
-        val_loss = 0
-        val_count = 0
+    logger.info("🎯 Starting training...")
+    for epoch in range(args.epochs):
+        logger.info(f"\n📊 Epoch {epoch+1}/{args.epochs}")
         
-        with torch.no_grad():
-            for _ in range(10):  # Validate on 10 batches
-                try:
-                    val_batch = next(dataloader_val_iter)
-                except StopIteration:
-                    dataloader_val_iter = iter(cycle(dataloader_val))
-                    val_batch = next(dataloader_val_iter)
-                
-                # Move to device
-                for key in val_batch:
-                    if isinstance(val_batch[key], torch.Tensor):
-                        val_batch[key] = val_batch[key].to(device, non_blocking=False)
-                
-                # Sample timestep
-                t_val = torch.randint(0, diffusion_steps, (val_batch['corners_withsemantics'].shape[0],), device=device).long()
-                
-                # Get noisy data
-                noise_val = torch.randn_like(val_batch['corners_withsemantics'])
-                sqrt_alphas_cumprod_t_val = torch.tensor(sqrt_recip_alphas_cumprod[t_val], device=device).float()
-                sqrt_one_minus_alphas_cumprod_t_val = torch.tensor(sqrt_recipm1_alphas_cumprod[t_val], device=device).float()
-                
-                noisy_corners_val = sqrt_alphas_cumprod_t_val.view(-1, 1, 1) * val_batch['corners_withsemantics'] + \
-                                   sqrt_one_minus_alphas_cumprod_t_val.view(-1, 1, 1) * noise_val
-                
-                # Predict noise
-                predicted_noise_val = model(noisy_corners_val, t_val, val_batch['global_attention_matrix'], val_batch['padding_mask'])
-                
-                # Compute loss
-                val_loss += F.mse_loss(predicted_noise_val, noise_val).item()
-                val_count += 1
+        # Train
+        train_loss = train_epoch(model, train_loader, optimizer, criterion, device, logger)
+        logger.info(f"📈 Train Loss: {train_loss:.4f}")
         
-        val_loss /= val_count
-        val_metrics.append(val_loss)
-        print(f'Validation Loss: {val_loss:.6f}')
+        # Validate
+        val_loss = validate_epoch(model, val_loader, criterion, device, logger)
+        logger.info(f"📉 Val Loss: {val_loss:.4f}")
         
         # Save checkpoint
-        checkpoint = {
-            'step': step,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'loss': loss.item(),
-            'val_loss': val_loss,
-            'loss_curve': loss_curve,
-            'val_metrics': val_metrics
-        }
-        torch.save(checkpoint, os.path.join(output_dir, f'checkpoint_step_{step}.pth'))
-        print(f'Saved checkpoint at step {step}')
+        if (epoch + 1) % args.save_interval == 0:
+            checkpoint_path = save_checkpoint(model, optimizer, epoch, val_loss, save_dir)
+            logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+        
+        # Save best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = os.path.join(save_dir, 'best_model.pth')
+            torch.save(model.state_dict(), best_path)
+            logger.info(f"🏆 New best model saved: {best_path}")
+        
+        # Clear GPU cache
+        torch.cuda.empty_cache()
     
-    step += 1
+    logger.info("✅ Training completed!")
+    logger.info(f"🏆 Best validation loss: {best_val_loss:.4f}")
 
-# Save final model
-torch.save(model.state_dict(), os.path.join(output_dir, 'final_model.pth'))
-print('Training completed!')
-print(f'Final model saved to {output_dir}')
+if __name__ == "__main__":
+    main()

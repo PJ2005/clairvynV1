@@ -2,69 +2,55 @@
 """
 GSDiff Training Launcher
 
-This script launches optimized GSDiff training using MPS (Metal Performance Shaders) on Apple Silicon.
+This script launches optimized GSDiff training with CUDA support.
 """
 
 import os
 import sys
 import subprocess
 import torch
+import psutil
 import time
+from datetime import datetime
 
-def check_mps():
-    """Check MPS availability and specs."""
-    print("🔍 Checking MPS Configuration...")
-    print("="*50)
-    
-    if torch.backends.mps.is_available():
-        print("✅ MPS Available: True")
-        print("✅ Metal Performance Shaders: Enabled")
-        print("✅ GPU Acceleration: Available")
-        
-        # Check M3 Air specs
-        try:
-            import platform
-            system_info = platform.platform()
-            print(f"✅ System: {system_info}")
-            
-            # Check memory
-            import psutil
-            memory_gb = psutil.virtual_memory().total / 1e9
-            print(f"✅ Total Memory: {memory_gb:.1f} GB")
-            
-            # Check CPU cores
-            cpu_cores = psutil.cpu_count()
-            print(f"✅ CPU Cores: {cpu_cores}")
-            
-        except ImportError:
-            print("⚠️ Install psutil for detailed system info: pip install psutil")
-        
+def check_gpu():
+    """Check GPU availability and specs."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"✅ GPU: {gpu_name}")
+        print(f"✅ GPU Memory: {gpu_memory:.1f}GB")
         return True
     else:
-        print("❌ MPS not available - Cannot run GPU training")
-        print("⚠️ Falling back to CPU training (very slow)")
+        print("❌ No CUDA GPU available")
         return False
+
+def check_system_resources():
+    """Check system resources."""
+    print("\n🖥️ System Resources:")
+    print(f"CPU: {psutil.cpu_count()} cores")
+    print(f"RAM: {psutil.virtual_memory().total / 1e9:.1f}GB")
+    print(f"Disk: {psutil.disk_usage('/').free / 1e9:.1f}GB free")
+    
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
 
 def check_data():
     """Check if training data is available."""
-    print("\n📁 Checking Training Data...")
-    print("="*50)
-    
     data_dirs = [
         "GSDiff/datasets/rplang-v3-withsemantics/train",
-        "GSDiff/datasets/rplang-v3-withsemantics/val",
-        "GSDiff/datasets/rplang-v3-withsemantics/test"
+        "GSDiff/datasets/rplang-v3-withsemantics/val"
     ]
     
     total_files = 0
     for data_dir in data_dirs:
         if os.path.exists(data_dir):
-            files = [f for f in os.listdir(data_dir) if f.endswith('.npy')]
-            print(f"✅ {data_dir}: {len(files)} files")
+            files = [f for f in os.listdir(data_dir) if f.endswith('.pkl')]
             total_files += len(files)
+            print(f"✅ {data_dir}: {len(files)} files")
         else:
-            print(f"❌ Missing: {data_dir}")
-            return False
+            print(f"❌ {data_dir}: Not found")
     
     print(f"✅ Total training files: {total_files}")
     return total_files > 0
@@ -73,11 +59,11 @@ def run_training():
     """Run GSDiff training."""
     print("\n🚀 GSDiff Training Launcher")
     print("="*60)
-    print("Optimized for Apple Silicon MPS (Metal Performance Shaders)")
+    print("Optimized for CUDA GPU training")
     print("="*60)
     
-    # Check MPS
-    mps_available = check_mps()
+    # Check GPU
+    gpu_available = check_gpu()
     
     # Check data
     if not check_data():
@@ -89,7 +75,7 @@ def run_training():
     print("2. Stage 2: Edge Generation")
     print("3. Monitor Training Progress")
     print("4. Check System Resources")
-    print("5. Test MPS Performance")
+    print("5. Test GPU Performance")
     
     choice = input("\nSelect option (1-5): ").strip()
     
@@ -103,37 +89,29 @@ def run_training():
         print(f"\n🔄 Starting {script}...")
         print("="*60)
         
-        # Change to scripts directory
+        # Change to GSDiff scripts directory
         os.chdir("GSDiff/scripts")
         
-        # Set environment variables for MPS optimization
-        env = os.environ.copy()
-        env['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'  # Enable MPS fallback
-        
         try:
-            # Start training with MPS environment
-            process = subprocess.Popen(
-                [sys.executable, script],
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1
-            )
+            # Run training script
+            process = subprocess.Popen([
+                sys.executable, script,
+                "--batch_size", "128" if choice == "1" else "64",
+                "--epochs", "100",
+                "--lr", "1e-4"
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             
-            # Stream output in real-time
+            # Stream output
             for line in process.stdout:
                 print(line.rstrip())
             
             process.wait()
             
             if process.returncode == 0:
-                print(f"\n✅ {script} completed successfully!")
+                print("\n✅ Training completed successfully!")
             else:
-                print(f"\n❌ {script} failed with return code {process.returncode}")
+                print(f"\n❌ Training failed with return code {process.returncode}")
                 
-        except subprocess.CalledProcessError as e:
-            print(f"❌ Training failed: {e}")
         except KeyboardInterrupt:
             print("\n⏹️ Training interrupted by user")
             if 'process' in locals():
@@ -146,7 +124,7 @@ def run_training():
         check_system_resources()
     
     elif choice == "5":
-        test_mps_performance()
+        test_gpu_performance()
     
     else:
         print("❌ Invalid choice")
@@ -154,120 +132,113 @@ def run_training():
 def monitor_training():
     """Monitor training progress."""
     print("\n📊 Training Progress Monitor")
-    print("="*50)
+    print("="*40)
     
-    # Check for checkpoint files
-    checkpoint_dirs = [
+    # Check for training logs
+    log_dirs = [
         "GSDiff/scripts/outputs/structure-1",
         "GSDiff/scripts/outputs/structure-2"
     ]
     
-    for checkpoint_dir in checkpoint_dirs:
-        if os.path.exists(checkpoint_dir):
-            files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_')]
-            if files:
-                print(f"✅ {checkpoint_dir}: {len(files)} checkpoints")
-                # Show latest checkpoint
-                latest = max(files, key=lambda x: int(x.split('_')[-1].split('.')[0]))
-                print(f"   Latest: {latest}")
+    for log_dir in log_dirs:
+        if os.path.exists(log_dir):
+            log_file = os.path.join(log_dir, "training.log")
+            if os.path.exists(log_file):
+                print(f"\n📁 {log_dir}:")
+                try:
+                    with open(log_file, 'r') as f:
+                        lines = f.readlines()
+                        if lines:
+                            print("Last 5 lines:")
+                            for line in lines[-5:]:
+                                print(f"  {line.strip()}")
+                        else:
+                            print("  No log entries yet")
+                except Exception as e:
+                    print(f"  Error reading log: {e}")
             else:
-                print(f"⚠️  {checkpoint_dir}: No checkpoints found")
+                print(f"  No training.log found")
         else:
-            print(f"❌ {checkpoint_dir}: Directory not found")
+            print(f"  Directory not found: {log_dir}")
+    
+    # Check for checkpoints
+    print("\n💾 Checkpoints:")
+    for log_dir in log_dirs:
+        if os.path.exists(log_dir):
+            checkpoints = [f for f in os.listdir(log_dir) if f.startswith('checkpoint_')]
+            if checkpoints:
+                print(f"  {log_dir}: {len(checkpoints)} checkpoints")
+                for cp in sorted(checkpoints)[-3:]:  # Show last 3
+                    print(f"    - {cp}")
+            else:
+                print(f"  {log_dir}: No checkpoints yet")
 
-def check_system_resources():
-    """Check system resources."""
-    print("\n💻 System Resources")
-    print("="*50)
+def test_gpu_performance():
+    """Test GPU performance."""
+    print("\n⚡ GPU Performance Test")
+    print("="*40)
     
-    # Check MPS
-    if torch.backends.mps.is_available():
-        print("✅ MPS: Available")
-        print("✅ GPU: M3 Air GPU (Metal Performance Shaders)")
-    else:
-        print("❌ MPS: Not available")
-    
-    # Check CPU and Memory
-    try:
-        import psutil
-        print(f"CPU Cores: {psutil.cpu_count()}")
-        print(f"CPU Usage: {psutil.cpu_percent()}%")
-        print(f"RAM: {psutil.virtual_memory().total / 1e9:.1f} GB")
-        print(f"RAM Used: {psutil.virtual_memory().used / 1e9:.1f} GB")
-        print(f"RAM Available: {psutil.virtual_memory().available / 1e9:.1f} GB")
-    except ImportError:
-        print("Install psutil for detailed system info: pip install psutil")
-    
-    # Check disk space
-    try:
-        import shutil
-        total, used, free = shutil.disk_usage(".")
-        print(f"Disk Space: {total / 1e9:.1f} GB total, {free / 1e9:.1f} GB free")
-    except:
-        print("Could not get disk space info")
-
-def test_mps_performance():
-    """Test MPS performance."""
-    print("\n🧪 MPS Performance Test")
-    print("="*50)
-    
-    if not torch.backends.mps.is_available():
-        print("❌ MPS not available - cannot run performance test")
+    if not torch.cuda.is_available():
+        print("❌ CUDA not available")
         return
     
-    print("Testing MPS performance...")
+    device = torch.device('cuda:0')
     
-    # Test 1: Basic tensor operations
-    print("\n1. Basic Tensor Operations:")
-    start_time = time.time()
+    # Test matrix multiplication
+    print("🧮 Testing matrix multiplication...")
+    sizes = [1000, 2000, 4000]
     
-    # Create tensors on MPS
-    x = torch.randn(1000, 1000, device='mps')
-    y = torch.randn(1000, 1000, device='mps')
+    for size in sizes:
+        try:
+            # Create random matrices
+            a = torch.randn(size, size, device=device)
+            b = torch.randn(size, size, device=device)
+            
+            # Time the operation
+            start_time = time.time()
+            c = torch.matmul(a, b)
+            torch.cuda.synchronize()  # Wait for GPU to finish
+            end_time = time.time()
+            
+            duration = end_time - start_time
+            print(f"  {size}x{size}: {duration:.3f}s")
+            
+        except Exception as e:
+            print(f"  {size}x{size}: Error - {e}")
     
-    # Matrix multiplication
-    z = torch.mm(x, y)
-    
-    mps_time = time.time() - start_time
-    print(f"   MPS Time: {mps_time:.4f} seconds")
-    
-    # Test 2: Neural network operations
-    print("\n2. Neural Network Operations:")
-    start_time = time.time()
-    
-    # Create a simple model
-    model = torch.nn.Linear(1000, 1000).to('mps')
-    input_tensor = torch.randn(100, 1000, device='mps')
-    
-    # Forward pass
-    output = model(input_tensor)
-    
-    # Backward pass
-    loss = output.sum()
-    loss.backward()
-    
-    nn_time = time.time() - start_time
-    print(f"   Neural Network Time: {nn_time:.4f} seconds")
-    
-    # Test 3: Memory usage
-    print("\n3. Memory Usage:")
-    if hasattr(torch.mps, 'current_allocated_memory'):
-        allocated = torch.mps.current_allocated_memory() / 1e9
-        print(f"   MPS Memory Allocated: {allocated:.2f} GB")
-    
-    print("\n✅ MPS Performance Test Completed!")
-    print("If times are reasonable (< 1 second), MPS is working well.")
+    # Test memory allocation
+    print("\n💾 Testing memory allocation...")
+    try:
+        # Allocate large tensor
+        large_tensor = torch.randn(1000, 1000, 1000, device=device)
+        memory_used = torch.cuda.memory_allocated(0) / 1e9
+        print(f"  Allocated: {memory_used:.2f}GB")
+        
+        # Clear memory
+        del large_tensor
+        torch.cuda.empty_cache()
+        memory_after = torch.cuda.memory_allocated(0) / 1e9
+        print(f"  After cleanup: {memory_after:.2f}GB")
+        
+    except Exception as e:
+        print(f"  Memory test error: {e}")
 
 def main():
     """Main function."""
+    print("🎯 GSDiff Training Launcher")
+    print("="*60)
+    
+    # Check if we're in the right directory
+    if not os.path.exists("GSDiff"):
+        print("❌ GSDiff directory not found. Please run from project root.")
+        return
+    
     try:
         run_training()
     except KeyboardInterrupt:
-        print("\n\n👋 Training launcher cancelled by user.")
+        print("\n👋 Goodbye!")
     except Exception as e:
-        print(f"\n💥 Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n❌ Error: {e}")
 
 if __name__ == "__main__":
     main()

@@ -1,49 +1,59 @@
-# GSDiff Training Requirements for M3 Air MPS
-# Optimized for Apple Silicon with Metal Performance Shaders
+# GSDiff Training Requirements - G5.2xlarge Optimized
+# Optimized for AWS G5.2xlarge with NVIDIA A10G GPU
 
-# Core PyTorch with MPS support
+# Core ML Framework
 torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
 
-# Scientific computing
+# CUDA Support (for G5.2xlarge)
+# Note: Install CUDA version compatible with your PyTorch version
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+
+# Data Processing
 numpy>=1.21.0
+pandas>=1.3.0
 scipy>=1.7.0
-scikit-learn>=1.0.0
 
-# Computer vision
+# Computer Vision
 opencv-python>=4.5.0
-pillow>=8.0.0
+Pillow>=8.3.0
+scikit-image>=0.18.0
 
-# Graph processing
+# Graph Processing
 networkx>=2.6.0
 
-# Progress and monitoring
+# Progress and Monitoring
 tqdm>=4.62.0
-psutil>=5.8.0
+tensorboard>=2.7.0
+wandb>=0.12.0
 
-# Visualization
+# Utilities
 matplotlib>=3.5.0
+seaborn>=0.11.0
+plotly>=5.0.0
 
-# Data handling
+# File I/O
 h5py>=3.1.0
+pickle5>=0.0.11
 
-# JSON schema validation
+# System Monitoring
+psutil>=5.8.0
+GPUtil>=1.4.0
+
+# JSON Schema Validation
 jsonschema>=4.0.0
 
-# HTTP requests
+# HTTP Requests
 requests>=2.25.0
 
-# DXF generation
+# DXF Generation
 ezdxf>=1.0.0
 
-# Additional optimizations
-einops>=0.4.0
-tensorboard>=2.8.0
-
-# Development tools
+# Development Tools
 jupyter>=1.0.0
-ipython>=7.0.0
+ipykernel>=6.0.0
 
-# M3 Air specific optimizations
-# Note: These are automatically handled by PyTorch MPS backend
+# Optional: For better performance
+# numba>=0.56.0
+# cupy-cuda11x>=10.0.0  # For additional GPU acceleration
