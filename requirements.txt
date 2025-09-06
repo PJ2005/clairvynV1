@@ -1,0 +1,49 @@
+# GSDiff Training Requirements for M3 Air MPS
+# Optimized for Apple Silicon with Metal Performance Shaders
+
+# Core PyTorch with MPS support
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Scientific computing
+numpy>=1.21.0
+scipy>=1.7.0
+scikit-learn>=1.0.0
+
+# Computer vision
+opencv-python>=4.5.0
+pillow>=8.0.0
+
+# Graph processing
+networkx>=2.6.0
+
+# Progress and monitoring
+tqdm>=4.62.0
+psutil>=5.8.0
+
+# Visualization
+matplotlib>=3.5.0
+
+# Data handling
+h5py>=3.1.0
+
+# JSON schema validation
+jsonschema>=4.0.0
+
+# HTTP requests
+requests>=2.25.0
+
+# DXF generation
+ezdxf>=1.0.0
+
+# Additional optimizations
+einops>=0.4.0
+tensorboard>=2.8.0
+
+# Development tools
+jupyter>=1.0.0
+ipython>=7.0.0
+
+# M3 Air specific optimizations
+# Note: These are automatically handled by PyTorch MPS backend
